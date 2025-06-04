@@ -2,7 +2,7 @@ import sys
 from pxr import Usd
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtWidgets import QPushButton, QFileDialog, QVBoxLayout, QDialog
-from asset_viewer.gui import viewer as _main_viewer
+from helios.gui import viewer as _main_viewer
 
 
 class USDViewerWindow(QDialog):
