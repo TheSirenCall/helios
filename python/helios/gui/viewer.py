@@ -1,225 +1,213 @@
-import OpenGL.GL as gl
-import OpenGL.GLU as glu
-from pxr import UsdGeom
-import numpy as np
+"""
+Displays and interacts with the current scene.
+
+The viewport owns the camera, renders the scene through
+SceneExtractor, and dispatches user input to the tool system. Camera
+navigation is always available, while editing and selection are handled
+by the active tool.
+
+The viewport depends only on the SceneGraph and renderer interfaces,
+remaining independent of scene importers and file formats.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
 from PySide6 import QtCore
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
+from helios.core.camera import CameraState
+from helios.core.events.bus import EventBus
+from helios.core.events.events import RenderStatsUpdated, SceneModified, SelectionChanged
+from helios.core.render_scene import RenderScene
+from helios.core.scene_extractor import SceneExtractor
+from helios.core.selection import SelectionService
+from helios.renderers.base import Renderer
+from helios.scene.graph import SceneGraph
+from helios.tools.light import LightTool
+from helios.tools.manager import ToolManager
+from helios.tools.orbit import OrbitTool
+from helios.tools.pan import PanTool
+from helios.tools.zoom import ZoomTool
 
-class USDViewer(QOpenGLWidget):
-    def __init__(self, parent=None):
+logger = logging.getLogger(__name__)
+
+
+class SceneViewport(QOpenGLWidget):
+    def __init__(self, renderer: Renderer, event_bus: EventBus,
+                 selection_service: SelectionService, tool_manager: ToolManager, parent=None):
         super().__init__(parent)
-        self.usd_file = None
-        self.vertices = np.array([], dtype=np.float32)
-        self.normals = np.array([], dtype=np.float32)
-        self.indices = np.array([], dtype=np.uint32)
-        self.camera_pos = [0, 0, 10]
-        self.angle_x = 0
-        self.angle_y = 0
-        self.zoom = 1.0
-        self.pan_x = 0
-        self.pan_y = 0
-        self.last_mouse_pos = None
-        self.bounding_box = None
-        self.light_pos = [5.0, 5.0, 5.0, 1.0]  # Positional light
-        self.light_move = False
+        # QOpenGLWidget defaults to Qt.NoFocus and without this,
+        # keyPressEvent (Q/W/E/R tool switch, Escape to clear) would
+        # silently never fire, no matter how correct its body is.
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.renderer = renderer
+        self.camera = CameraState()
+        self.event_bus = event_bus
+        self.selection_service = selection_service
+        self.tool_manager = tool_manager
+        self.extractor = SceneExtractor()
+
+        # Always on camera navigation, independent of the active tool
+        # Alt+drag orbit/pan/zoom and Ctrl+drag light work no matter
+        # which manipulation tool (Select, future Move/Rotate/Scale) is active.
+        self._nav_tools = [OrbitTool(), PanTool(), ZoomTool(), LightTool()]
+
+        self.scene: Optional[SceneGraph] = None
+        self.current_frame = 0.0
+
+        event_bus.subscribe(SelectionChanged, self._on_selection_changed)
+        event_bus.subscribe(SceneModified, self._on_scene_modified)
 
     def initializeGL(self):
-        gl.glEnable(gl.GL_DEPTH_TEST)
-        gl.glShadeModel(gl.GL_SMOOTH)
-        gl.glClearColor(0.1, 0.1, 0.1, 1.0)
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glLoadIdentity()
-        glu.gluPerspective(45, self.width() / self.height(), 0.1, 100000)
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-
-        gl.glEnable(gl.GL_LIGHTING)
-        gl.glEnable(gl.GL_LIGHT0)
-
-        light_position = [1.0, 1.0, 1.0, 0.0]
-        light_color = [1.0, 1.0, 1.0, 1.0]
-        gl.glLightfv(gl.GL_LIGHT0, gl.GL_POSITION, light_position)
-        gl.glLightfv(gl.GL_LIGHT0, gl.GL_DIFFUSE, light_color)
-        gl.glLightfv(gl.GL_LIGHT0, gl.GL_SPECULAR, light_color)
-
-        gl.glEnable(gl.GL_COLOR_MATERIAL)
-        gl.glColorMaterial(gl.GL_FRONT_AND_BACK, gl.GL_AMBIENT_AND_DIFFUSE)
+        self.renderer.initialize()
+        self.resizeGL(self.width(), self.height())
 
     def resizeGL(self, w, h):
-        gl.glViewport(0, 0, w, h)
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glLoadIdentity()
-        glu.gluPerspective(45, w / h, 0.1, 100000)
-        gl.glMatrixMode(gl.GL_MODELVIEW)
+        self.renderer.resize(w, h)
 
     def paintGL(self):
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-        gl.glLoadIdentity()
-        glu.gluLookAt(self.camera_pos[0] + self.pan_x, self.camera_pos[1] + self.pan_y, self.camera_pos[2] / self.zoom,
-                      0, 0, 0, 0, 1, 0)
-        gl.glRotatef(self.angle_x, 1, 0, 0)
-        gl.glRotatef(self.angle_y, 0, 1, 0)
+        render_scene = self.extractor.extract(self.scene, self.current_frame)
+        self.renderer.draw(render_scene, self.camera)
+        self._publish_render_stats()
 
-        gl.glLightfv(gl.GL_LIGHT0, gl.GL_POSITION, self.light_pos)
+    def _publish_render_stats(self) -> None:
+        """
+        Publishes renderer statistics when supported by the active backend.
 
-        # Draw grid
-        gl.glColor3f(0.5, 0.5, 0.5)
-        gl.glBegin(gl.GL_LINES)
-        for i in range(-10, 11):
-            gl.glVertex3f(i, 0, -10)
-            gl.glVertex3f(i, 0, 10)
-            gl.glVertex3f(-10, 0, i)
-            gl.glVertex3f(10, 0, i)
-        gl.glEnd()
+        Statistics are an optional renderer capability rather than part of the
+        Renderer interface, allowing backends to expose implementation specific
+        metrics or omit them entirely.
+        """
+        stats = getattr(self.renderer, "stats", None)
+        if stats is None:
+            return
+        fps = 1000.0 / stats.cpu_frame_ms if stats.cpu_frame_ms > 0 else 0.0
+        self.event_bus.publish(RenderStatsUpdated(
+            cpu_frame_ms=stats.cpu_frame_ms, fps=fps,
+            draw_calls=stats.draw_calls, triangles=stats.triangles, vertices=stats.vertices,
+            buffer_uploads=stats.buffer_uploads, uploaded_vertices=stats.uploaded_vertices,
+            shader_switches=stats.shader_switches,
+        ))
 
-        if self.vertices.size > 0:
-            # Set material properties
-            material_diffuse = [0.7, 0.7, 0.7, 1.0]
-            material_specular = [1.0, 1.0, 1.0, 1.0]
-            material_shininess = [50.0]
-            gl.glMaterialfv(gl.GL_FRONT_AND_BACK, gl.GL_DIFFUSE, material_diffuse)
-            gl.glMaterialfv(gl.GL_FRONT_AND_BACK, gl.GL_SPECULAR, material_specular)
-            gl.glMaterialfv(gl.GL_FRONT_AND_BACK, gl.GL_SHININESS, material_shininess)
+    def current_render_scene(self) -> RenderScene:
+        """
+        Returns the most recently extracted RenderScene.
 
-            # Draw geometry
-            gl.glEnableClientState(gl.GL_VERTEX_ARRAY)
-            gl.glEnableClientState(gl.GL_NORMAL_ARRAY)
-            gl.glVertexPointer(3, gl.GL_FLOAT, 0, self.vertices)
-            gl.glNormalPointer(gl.GL_FLOAT, 0, self.normals)
-            gl.glDrawElements(gl.GL_TRIANGLES, len(self.indices), gl.GL_UNSIGNED_INT, self.indices)
-            gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
-            gl.glDisableClientState(gl.GL_NORMAL_ARRAY)
+        Rendering and viewport tools share the same cached scene, ensuring they
+        operate on the same data without triggering additional extraction.
+        """
+        return self.extractor.extract(self.scene, self.current_frame)
 
-            # Draw bounding box
-            if self.bounding_box:
-                gl.glColor3f(1.0, 0.0, 0.0)
-                gl.glBegin(gl.GL_LINE_LOOP)
-                for i in range(8):
-                    gl.glVertex3fv(self.bounding_box[i])
-                gl.glEnd()
+    def set_scene(self, scene: Optional[SceneGraph]):
+        self.scene = scene
+        self.reset_camera()
+        if scene is not None:
+            self.set_frame(scene.frame_range[0])
+        else:
+            self.update()
 
-    def extract_geometry(self, usd_stage):
-        vertices = []
-        normals = []
-        indices = []
-        bbox_min = [float('inf')] * 3
-        bbox_max = [float('-inf')] * 3
+    def set_frame(self, frame: float):
+        self.current_frame = frame
+        self.update()
 
-        for prim in usd_stage.Traverse():
-            if prim.IsA(UsdGeom.Mesh):
-                mesh = UsdGeom.Mesh(prim)
-                points = mesh.GetPointsAttr().Get()
-                face_vertex_counts = mesh.GetFaceVertexCountsAttr().Get()
-                face_vertex_indices = mesh.GetFaceVertexIndicesAttr().Get()
-                normals_attr = mesh.GetNormalsAttr()
+    def reset_camera(self):
+        """
+        Restores the default camera framing.
 
-                if points and face_vertex_counts and face_vertex_indices:
-                    start_idx = len(vertices)
-                    vertices.extend([(p[0], p[1], p[2]) for p in points])
+        The scene uses a normalized coordinate space, so the default camera
+        always frames it without requiring scene dependent calculations.
+        """
+        self.camera.reset()
+        self.update()
 
-                    normals.extend([np.zeros(3) for _ in range(len(points))])
+    def cleanup(self) -> None:
+        """
+        Releases renderer GPU resources.
 
-                    idx = 0
-                    for count in face_vertex_counts:
-                        if count >= 3:
-                            face_indices = face_vertex_indices[idx:idx + count]
-                            face_vertices = [vertices[start_idx + i] for i in face_indices]
+        This should be called before the viewport is destroyed. The viewport
+        makes its OpenGL context current to ensure resources are released
+        correctly.
+        """
+        self.makeCurrent()
+        try:
+            self.renderer.destroy()
+        finally:
+            self.doneCurrent()
 
-                            v0 = np.array(face_vertices[0])
-                            v1 = np.array(face_vertices[1])
-                            v2 = np.array(face_vertices[2])
-                            face_normal = np.cross(v1 - v0, v2 - v0)
-                            norm = np.linalg.norm(face_normal)
+    def _on_selection_changed(self, event: SelectionChanged) -> None:
+        logger.debug("SceneViewport: SelectionChanged -> highlight(%s)", event.selected_paths)
+        self.renderer.highlight(event.selected_paths)
 
-                            if norm > 1e-6:
-                                face_normal /= norm
-                            else:
-                                idx += count
-                                continue
+        # Keep SceneNode.selected synchronized with SelectionService.
+        # SelectionService owns the selection state, while SceneGraph queries
+        # rely on the per-node selected flag.
+        if self.scene is not None:
+            selected_set = set(event.selected_paths)
+            for node in self.scene.walk():
+                node.selected = node.path in selected_set
 
-                            for i in face_indices:
-                                normals[start_idx + i] += face_normal
+        self.update()
 
-                        idx += count
+    def _on_scene_modified(self, _event: SceneModified) -> None:
+        """
+        Invalidates the extracted scene cache.
 
-                    for i in range(len(normals)):
-                        norm = np.linalg.norm(normals[i])
-                        if norm > 1e-6:
-                            normals[i] /= norm
-                        else:
-                            normals[i] = np.array([0.0, 1.0, 0.0])
+        Scene edits can change the sampled output without changing the scene
+        identity or current frame, so cached render data must be discarded after
+        in-place modifications.
+        """
+        self.extractor.invalidate()
+        self.update()
 
-                    idx = 0
-                    for count in face_vertex_counts:
-                        if count == 3:
-                            indices.extend([face_vertex_indices[idx + i] + start_idx for i in range(3)])
-                        elif count == 4:
-                            indices.extend([
-                                face_vertex_indices[idx] + start_idx,
-                                face_vertex_indices[idx + 1] + start_idx,
-                                face_vertex_indices[idx + 2] + start_idx,
-                                face_vertex_indices[idx] + start_idx,
-                                face_vertex_indices[idx + 2] + start_idx,
-                                face_vertex_indices[idx + 3] + start_idx,
-                            ])
-                        else:
-                            for i in range(1, count - 1):
-                                indices.extend([
-                                    face_vertex_indices[idx] + start_idx,
-                                    face_vertex_indices[idx + i] + start_idx,
-                                    face_vertex_indices[idx + i + 1] + start_idx,
-                                ])
-                        idx += count
-
-                    for p in points:
-                        for i in range(3):
-                            bbox_min[i] = min(bbox_min[i], p[i])
-                            bbox_max[i] = max(bbox_max[i], p[i])
-
-        center = [(bbox_min[i] + bbox_max[i]) / 2 for i in range(3)]
-        scale = 2.0 / max(bbox_max[i] - bbox_min[i] for i in range(3))
-        vertices = [((v[0] - center[0]) * scale,
-                     (v[1] - center[1]) * scale,
-                     (v[2] - center[2]) * scale) for v in vertices]
-
-        self.bounding_box = [
-            [bbox_min[0], bbox_min[1], bbox_min[2]],
-            [bbox_max[0], bbox_min[1], bbox_min[2]],
-            [bbox_max[0], bbox_max[1], bbox_min[2]],
-            [bbox_min[0], bbox_max[1], bbox_min[2]],
-            [bbox_min[0], bbox_min[1], bbox_max[2]],
-            [bbox_max[0], bbox_min[1], bbox_max[2]],
-            [bbox_max[0], bbox_max[1], bbox_max[2]],
-            [bbox_min[0], bbox_max[1], bbox_max[2]]
-        ]
-        return np.array(vertices, dtype=np.float32), np.array(normals, dtype=np.float32), np.array(indices,
-                                                                                                   dtype=np.uint32)
-
+    # Event dispatch. Input events are forwarded to the navigation tools
+    # and the active tool; interaction logic is implemented by the tools,
+    # not the viewport.
     def mousePressEvent(self, event):
-        self.last_mouse_pos = event.position()
-        self.light_move = (event.modifiers() == QtCore.Qt.KeyboardModifier.ControlModifier)
+        self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+        logger.debug("SceneViewport: mousePressEvent at %s, active tool=%s",
+                     event.position(), self.tool_manager.active_tool)
+        for tool in self._nav_tools:
+            tool.on_mouse_press(self, event)
+        if self.tool_manager.active_tool is not None:
+            self.tool_manager.active_tool.on_mouse_press(self, event)
 
     def mouseMoveEvent(self, event):
-        if self.last_mouse_pos:
-            dx = event.position().x() - self.last_mouse_pos.x()
-            dy = event.position().y() - self.last_mouse_pos.y()
+        for tool in self._nav_tools:
+            tool.on_mouse_move(self, event)
+        if self.tool_manager.active_tool is not None:
+            self.tool_manager.active_tool.on_mouse_move(self, event)
 
-            if self.light_move:
-                # Move light with mouse
-                self.light_pos[0] += dx * 0.1
-                self.light_pos[1] -= dy * 0.1
-            elif event.modifiers() == QtCore.Qt.KeyboardModifier.AltModifier:
-                # Original camera controls
-                if event.buttons() == QtCore.Qt.MouseButton.LeftButton:
-                    self.angle_x += dy * 0.5
-                    self.angle_y += dx * 0.5
-                elif event.buttons() == QtCore.Qt.MouseButton.MiddleButton:
-                    self.pan_x += dx * 0.01
-                    self.pan_y -= dy * 0.01
-                elif event.buttons() == QtCore.Qt.MouseButton.RightButton:
-                    self.zoom *= 1.0 + (dy * 0.01)
-            self.update()
-        self.last_mouse_pos = event.position()
+    def mouseReleaseEvent(self, event):
+        logger.debug("SceneViewport: mouseReleaseEvent at %s", event.position())
+        for tool in self._nav_tools:
+            tool.on_mouse_release(self, event)
+        if self.tool_manager.active_tool is not None:
+            self.tool_manager.active_tool.on_mouse_release(self, event)
+
     def wheelEvent(self, event):
-        self.zoom *= 1.0 + (event.angleDelta().y() * 0.001)
-        self.update()
+        for tool in self._nav_tools:
+            tool.on_wheel(self, event)
+        if self.tool_manager.active_tool is not None:
+            self.tool_manager.active_tool.on_wheel(self, event)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        tool_for_key = {
+            QtCore.Qt.Key.Key_Q: "select",
+            QtCore.Qt.Key.Key_W: "move",
+            QtCore.Qt.Key.Key_E: "rotate",
+            QtCore.Qt.Key.Key_R: "scale",
+        }.get(key)
+        if tool_for_key is not None:
+            try:
+                self.tool_manager.activate(tool_for_key, self)
+                logger.debug("SceneViewport: switched active tool to '%s'", tool_for_key)
+            except KeyError:
+                pass
+            return
+        if key == QtCore.Qt.Key.Key_Escape:
+            self.selection_service.clear()
+            return
+        super().keyPressEvent(event)
